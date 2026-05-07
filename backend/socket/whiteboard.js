@@ -1,12 +1,8 @@
 const Board = require('../models/Board');
 const jwt   = require('jsonwebtoken');
 
-// boardId → Set of socket ids present
-const rooms = new Map();
-// boardId → { canvasState, dirty }
+const rooms      = new Map();
 const stateCache = new Map();
-
-// Auto-save every 30 seconds
 const AUTO_SAVE_INTERVAL = 30_000;
 
 async function saveBoard(boardId) {
@@ -19,7 +15,7 @@ async function saveBoard(boardId) {
       $push: {
         revisions: {
           $each: [{ canvasState: cached.canvasState, savedBy: cached.lastEditorId }],
-          $slice: -50,  // keep latest 50 revisions
+          $slice: -50,
         },
       },
     });
@@ -31,13 +27,10 @@ async function saveBoard(boardId) {
 }
 
 setInterval(() => {
-  for (const boardId of stateCache.keys()) {
-    saveBoard(boardId);
-  }
+  for (const boardId of stateCache.keys()) saveBoard(boardId);
 }, AUTO_SAVE_INTERVAL);
 
 module.exports = (io) => {
-  // Auth middleware for Socket.io
   io.use((socket, next) => {
     const token = socket.handshake.auth?.token;
     if (!token) return next(new Error('Authentication required'));
@@ -54,8 +47,7 @@ module.exports = (io) => {
   io.on('connection', (socket) => {
     console.log(`[socket] Connected: ${socket.id}`);
 
-    // ── Join board room ───────────────────────────────────────────────────────
-    socket.on('join-board', async ({ boardId, token }) => {
+    socket.on('join-board', async ({ boardId }) => {
       try {
         const board = await Board.findById(boardId).populate('owner', 'username color');
         if (!board) return socket.emit('error', { message: 'Board not found' });
@@ -66,7 +58,6 @@ module.exports = (io) => {
         if (!rooms.has(boardId)) rooms.set(boardId, new Set());
         rooms.get(boardId).add(socket.id);
 
-        // Load state from cache or DB
         if (!stateCache.has(boardId)) {
           stateCache.set(boardId, {
             canvasState: board.canvasState || '{}',
@@ -75,20 +66,15 @@ module.exports = (io) => {
           });
         }
 
-        // Send current canvas state to the joining user
         socket.emit('board-state', {
           canvasState: stateCache.get(boardId).canvasState,
           boardTitle: board.title,
         });
 
-        // Notify others of new presence
         socket.to(boardId).emit('user-joined', {
-          userId:   socket.userId,
-          username: socket.username,
-          socketId: socket.id,
+          userId: socket.userId, username: socket.username, socketId: socket.id,
         });
 
-        // Broadcast updated presence list
         io.to(boardId).emit('presence-update', {
           users: [...(rooms.get(boardId) || [])].map(sid => {
             const s = io.sockets.sockets.get(sid);
@@ -100,13 +86,20 @@ module.exports = (io) => {
       }
     });
 
-    // ── Canvas delta broadcast ────────────────────────────────────────────────
-    // Delta: minimal change event (add/modify/remove object, or full state)
     socket.on('canvas-delta', ({ boardId, delta, fullState }) => {
-      // Broadcast delta to all OTHER users in the room
-      socket.to(boardId).emit('canvas-delta', { delta, from: socket.id });
+      // KEY FIX: include fullState INSIDE the delta object when broadcasting
+      // so the receiving client can do a full canvas reload
+      const deltaWithState = {
+        ...delta,
+        fullState: fullState ? JSON.parse(fullState) : null,
+      };
 
-      // Update cache
+      socket.to(boardId).emit('canvas-delta', {
+        delta: deltaWithState,
+        from: socket.id,
+      });
+
+      // Update cache for auto-save
       if (fullState && stateCache.has(boardId)) {
         const cached = stateCache.get(boardId);
         cached.canvasState  = fullState;
@@ -115,31 +108,26 @@ module.exports = (io) => {
       }
     });
 
-    // ── Cursor position ──────────────────────────────────────────────────────
     socket.on('cursor-move', ({ boardId, x, y }) => {
       socket.to(boardId).emit('cursor-move', {
-        socketId: socket.id,
-        userId:   socket.userId,
-        username: socket.username,
-        color:    socket.color || '#3b82f6',
+        socketId: socket.id, userId: socket.userId,
+        username: socket.username, color: socket.color || '#3b82f6',
         x, y,
       });
     });
 
-    // ── Manual save trigger ──────────────────────────────────────────────────
     socket.on('save-board', async ({ boardId }) => {
       await saveBoard(boardId);
       socket.emit('board-saved', { timestamp: new Date() });
     });
 
-    // ── Disconnect ───────────────────────────────────────────────────────────
     socket.on('disconnect', () => {
       const boardId = socket.boardId;
       if (boardId && rooms.has(boardId)) {
         rooms.get(boardId).delete(socket.id);
         socket.to(boardId).emit('user-left', { socketId: socket.id, userId: socket.userId });
         if (rooms.get(boardId).size === 0) {
-          saveBoard(boardId); // final save when room empties
+          saveBoard(boardId);
           rooms.delete(boardId);
         }
       }
